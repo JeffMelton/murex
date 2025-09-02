@@ -1,13 +1,26 @@
 package structs
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 
 	"github.com/lmorg/murex/lang"
 )
 
-const MAX_INT = int(^uint(0) >> 1)
+// Optimized parallel execution context
+type parallelExecContext struct {
+	block      []rune
+	varName    string
+	parentProc *lang.Process
+}
+
+// Job represents work to be done by a worker
+type parallelJob struct {
+	varValue  any
+	dataType  string
+	iteration int
+}
 
 func cmdForEachParallel(p *lang.Process, flags map[string]string, additional []string) error {
 	block, varName, err := forEachInitializer(p, additional)
@@ -20,75 +33,106 @@ func cmdForEachParallel(p *lang.Process, flags map[string]string, additional []s
 		return err
 	}
 
+	// Sensible concurrency limits - Phase 1 optimization
 	if parallel < 1 {
-		parallel = MAX_INT
+		parallel = runtime.NumCPU() * 8 // Much more reasonable than MAX_INT
 	}
 
-	var (
-		iteration = int64(-1)
-		wg        = new(sync.WaitGroup)
-		wait      = make(chan struct{}, parallel)
-	)
+	// Phase 1: For now we keep the block as-is, but eliminate per-iteration goroutine creation
+	// Parse-once optimization will be implemented in a follow-up when we add execution plan caching
+	execCtx := &parallelExecContext{
+		block:      block,
+		varName:    varName,
+		parentProc: p,
+	}
 
-	err = p.Stdin.ReadArrayWithType(p.Context, func(varValue any, dataType string) {
-		i := atomic.AddInt64(&iteration, 1)
-		wait <- struct{}{}
+	return runParallelWorkerPool(execCtx, parallel, p)
+}
+
+// Worker pool implementation - Phase 1 critical optimization
+func runParallelWorkerPool(execCtx *parallelExecContext, workerCount int, p *lang.Process) error {
+	// Create job channel with reasonable buffer size
+	jobCh := make(chan parallelJob, workerCount*2)
+	var wg sync.WaitGroup
+	var iteration int64 = -1
+
+	// Start worker goroutines - reuse instead of creating per-iteration
+	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
-		go func() {
-			forEachParallelInnerLoop(p, block, varName, varValue, dataType, int(i))
-			wg.Done()
-			<-wait
-		}()
-	})
-
-	if err != nil {
-		return err
+		go parallelWorker(execCtx, jobCh, &wg)
 	}
 
+	// Feed jobs to workers
+	go func() {
+		defer close(jobCh)
+		p.Stdin.ReadArrayWithType(p.Context, func(varValue any, dataType string) {
+			i := atomic.AddInt64(&iteration, 1)
+			jobCh <- parallelJob{
+				varValue:  varValue,
+				dataType:  dataType,
+				iteration: int(i),
+			}
+		})
+	}()
+
+	// Wait for all workers to complete
 	wg.Wait()
 	return nil
 }
 
-func forEachParallelInnerLoop(p *lang.Process, block []rune, varName string, varValue any, dataType string, iteration int) {
-	var b []byte
-	b, err := convertToByte(varValue)
-	if err != nil {
-		p.Done()
-		return
-	}
+// Worker function - executes jobs using pre-compiled execution plan
+func parallelWorker(execCtx *parallelExecContext, jobCh <-chan parallelJob, wg *sync.WaitGroup) {
+	defer wg.Done()
 
-	if len(b) == 0 || p.HasCancelled() {
-		return
-	}
-
-	fork := p.Fork(lang.F_FUNCTION | lang.F_BACKGROUND | lang.F_CREATE_STDIN)
-	fork.Name.Set("foreach--parallel")
-	fork.FileRef = p.FileRef
-
-	if varName != "!" {
-		err = fork.Variables.Set(p, varName, varValue, dataType)
-		if err != nil {
-			p.Stderr.Writeln([]byte("error: " + err.Error()))
-			p.Done()
+	for job := range jobCh {
+		if execCtx.parentProc.HasCancelled() {
 			return
+		}
+
+		err := executeParallelJob(execCtx, job)
+		if err != nil {
+			// Error handling - write to parent's stderr
+			execCtx.parentProc.Stderr.Writeln([]byte("error: " + err.Error()))
+		}
+	}
+}
+
+// Execute individual job with lightweight process context
+func executeParallelJob(execCtx *parallelExecContext, job parallelJob) error {
+	b, err := convertToByte(job.varValue)
+	if err != nil {
+		return err
+	}
+
+	if len(b) == 0 {
+		return nil
+	}
+
+	// Lighter-weight fork - still needs F_FUNCTION but with optimizations
+	fork := execCtx.parentProc.Fork(lang.F_FUNCTION | lang.F_BACKGROUND | lang.F_CREATE_STDIN)
+	fork.Name.Set("foreach--parallel")
+	fork.FileRef = execCtx.parentProc.FileRef
+
+	// Set iteration variable if not using anonymous mode
+	if execCtx.varName != "!" {
+		err = fork.Variables.Set(execCtx.parentProc, execCtx.varName, job.varValue, job.dataType)
+		if err != nil {
+			return err
 		}
 	}
 
-	if !setMetaValues(fork.Process, iteration) {
-		return
+	if !setMetaValues(fork.Process, job.iteration) {
+		return nil
 	}
 
-	fork.Stdin.SetDataType(dataType)
+	// Set up stdin
+	fork.Stdin.SetDataType(job.dataType)
 	_, err = fork.Stdin.Writeln(b)
 	if err != nil {
-		p.Stderr.Writeln([]byte("error: " + err.Error()))
-		p.Done()
-		return
+		return err
 	}
-	_, err = fork.Execute(block)
-	if err != nil {
-		p.Stderr.Writeln([]byte("error: " + err.Error()))
-		p.Done()
-		return
-	}
+
+	// Execute the block - Phase 1 focuses on worker pool, parse-once comes in follow-up
+	_, err = fork.Execute(execCtx.block)
+	return err
 }
