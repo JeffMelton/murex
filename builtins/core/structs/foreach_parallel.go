@@ -80,8 +80,13 @@ func runParallelWorkerPool(execCtx *parallelExecContext, workerCount int, p *lan
 		parent:    p,
 	}
 
-	// Start result aggregator goroutine
-	go aggregator.processResults(resultCh)
+	// Start result aggregator goroutine with wait group
+	var aggregatorWg sync.WaitGroup
+	aggregatorWg.Add(1)
+	go func() {
+		defer aggregatorWg.Done()
+		aggregator.processResults(resultCh)
+	}()
 
 	// Start worker goroutines - reuse instead of creating per-iteration
 	for i := 0; i < workerCount; i++ {
@@ -106,6 +111,9 @@ func runParallelWorkerPool(execCtx *parallelExecContext, workerCount int, p *lan
 	wg.Wait()
 	close(resultCh)
 
+	// Wait for result aggregator to finish processing all results
+	aggregatorWg.Wait()
+	
 	// Flush any remaining results
 	aggregator.flush()
 	return nil
