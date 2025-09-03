@@ -1,0 +1,47 @@
+#!/home/jeff@melton.casa/Development/murex/murex
+
+a %[ "microsoft/vscode" "facebook/react" "nodejs/node" "kubernetes/kubernetes" "golang/go" "rust-lang/rust" "python/cpython" "elastic/elasticsearch" ] -> foreach repo --parallel 8 {
+    $repo -> regexp 's|"||' -> set repo
+    gh issue list -R $repo --json id -> :json: len -> set issue_count
+    if { $issue_count > 5 } then {
+        gh api "/repos/$(repo)/contributors" -> :json: len -> set contributor_count
+        out "✓ $(repo): $(contributor_count) active contributors"
+    }
+}
+
+a %[europe asia americas africa] -> foreach item --parallel 4 {
+    $item -> regexp 's|"||' -> set region
+    get "https://restcountries.com/v3.1/region/$(region)?fields=name,currencies,population" -> [[ ,Body ]] -> foreach country {
+        $country -> [[ ,name,common ]] -> set name
+        $country -> [[ ,population ]] -> set population
+        $country -> [[ ,currencies ]] -> formap key value { out $key } -> set currencies
+        if { $population > 50000000 } then {
+            if { $currencies -> regexp 'm/USD|EUR|GBP|JPY|CNY/' } then {
+                $currencies -> foreach currency {
+                    get "https://api.exchangerate-api.com/v4/latest/$(currency)" -> [[ ,Body,rates,USD ]] -> set usd_rate
+                    if { $usd_rate } then {
+                        out "✓ $(name) - $(currency): 1 $(currency) = $(usd_rate) USD - Pop: $(population)"
+                    } else {
+                        out "✗ $(name) $(currency): Rate unavailable - Pop: $(population)"
+                    }
+                }
+            }
+        }
+    }
+}
+
+a [1..20] -> foreach post_id --parallel 10 {
+    get "https://jsonplaceholder.typicode.com/posts/$(post_id)" -> [[ ,Body ]] -> set post
+    $post -> [[ ,userId ]] -> set user_id
+    $post -> [[ ,title ]] -> set title
+    $post -> [[ ,body ]] -> wc -w -> set body_length
+    
+    if { $body_length > 20 } then {
+        get "https://jsonplaceholder.typicode.com/posts/$(post_id)/comments" -> [[ ,Body ]] -> len -> set comment_count
+        get "https://jsonplaceholder.typicode.com/users/$(user_id)" -> [[ ,Body ]] -> set user
+        $user -> [[ ,username ]] -> set username
+        $user -> [[ ,company,name ]] -> set company
+        out %(✓ Post $(post_id) by @$(username) $(company): $(comment_count) comments)
+    }
+}
+
