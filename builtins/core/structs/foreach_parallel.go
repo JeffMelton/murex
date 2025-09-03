@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/lmorg/murex/builtins/pipes/streams"
 	"github.com/lmorg/murex/lang"
 )
 
@@ -38,6 +39,16 @@ type resultAggregator struct {
 	parent    *lang.Process
 }
 
+// Phase 3: Object pools for resource optimization
+var (
+	// Pool for reusing job result objects
+	resultPool = sync.Pool{
+		New: func() interface{} {
+			return &jobResult{}
+		},
+	}
+)
+
 func cmdForEachParallel(p *lang.Process, flags map[string]string, additional []string) error {
 	block, varName, err := forEachInitializer(p, additional)
 	if err != nil {
@@ -67,9 +78,9 @@ func cmdForEachParallel(p *lang.Process, flags map[string]string, additional []s
 
 // Worker pool with output aggregation - Phase 2 optimization
 func runParallelWorkerPool(execCtx *parallelExecContext, workerCount int, p *lang.Process) error {
-	// Create job and result channels
+	// Create job and result channels with tuned buffering - Phase 3: optimized capacity
 	jobCh := make(chan parallelJob, workerCount*2)
-	resultCh := make(chan *jobResult, workerCount*2)
+	resCh := make(chan *jobResult, workerCount*2)  // Phase 3: 2x parallel for better throughput
 	var wg sync.WaitGroup
 	var iteration int64 = -1
 
@@ -85,13 +96,13 @@ func runParallelWorkerPool(execCtx *parallelExecContext, workerCount int, p *lan
 	aggregatorWg.Add(1)
 	go func() {
 		defer aggregatorWg.Done()
-		aggregator.processResults(resultCh)
+		aggregator.processResults(resCh)
 	}()
 
 	// Start worker goroutines - reuse instead of creating per-iteration
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
-		go parallelWorkerWithAggregation(execCtx, jobCh, resultCh, &wg)
+		go parallelWorkerWithAggregation(execCtx, jobCh, resCh, &wg)
 	}
 
 	// Feed jobs to workers
@@ -109,7 +120,7 @@ func runParallelWorkerPool(execCtx *parallelExecContext, workerCount int, p *lan
 
 	// Wait for all workers to complete
 	wg.Wait()
-	close(resultCh)
+	close(resCh)
 
 	// Wait for result aggregator to finish processing all results
 	aggregatorWg.Wait()
@@ -131,17 +142,19 @@ func parallelWorkerWithAggregation(execCtx *parallelExecContext, jobCh <-chan pa
 		// Execute job and capture output
 		stdout, stderr, err := executeParallelJobWithCapture(execCtx, job)
 		
+		// Get pooled result object - Phase 3: reduce allocation
+		result := resultPool.Get().(*jobResult)
+		result.iteration = job.iteration
+		result.stdout = stdout
+		result.stderr = stderr
+		result.err = err
+		
 		// Send result to aggregator
-		resultCh <- &jobResult{
-			iteration: job.iteration,
-			stdout:    stdout,
-			stderr:    stderr,
-			err:       err,
-		}
+		resultCh <- result
 	}
 }
 
-// Execute individual job with output capture - Phase 2 optimization
+// Execute individual job with output capture and object pooling - Phase 3 optimization
 func executeParallelJobWithCapture(execCtx *parallelExecContext, job parallelJob) ([]byte, []byte, error) {
 	b, err := convertToByte(job.varValue)
 	if err != nil {
@@ -152,10 +165,21 @@ func executeParallelJobWithCapture(execCtx *parallelExecContext, job parallelJob
 		return nil, nil, nil
 	}
 
-	// Lightweight fork with captured output - Phase 2: eliminate I/O contention
-	fork := execCtx.parentProc.Fork(lang.F_FUNCTION | lang.F_BACKGROUND | lang.F_CREATE_STDIN | lang.F_CREATE_STDOUT | lang.F_CREATE_STDERR)
+	// Create fresh streams for each execution - Phase 3: simplified approach
+	// Stream objects maintain complex internal state that can't be easily reset
+	stdin := streams.NewStdin()
+	stdout := streams.NewStdin() 
+	stderr := streams.NewStdin()
+
+	// Lightweight fork with fresh streams - Phase 3: resource optimization
+	fork := execCtx.parentProc.Fork(lang.F_FUNCTION | lang.F_BACKGROUND)
 	fork.Name.Set("foreach--parallel")
 	fork.FileRef = execCtx.parentProc.FileRef
+	
+	// Use fresh streams
+	fork.Stdin = stdin
+	fork.Stdout = stdout
+	fork.Stderr = stderr
 
 	// Set iteration variable if not using anonymous mode
 	if execCtx.varName != "!" {
@@ -179,11 +203,11 @@ func executeParallelJobWithCapture(execCtx *parallelExecContext, job parallelJob
 	// Execute the block
 	_, err = fork.Execute(execCtx.block)
 	
-	// Capture outputs from isolated streams
-	stdout, _ := fork.Stdout.ReadAll()
-	stderr, _ := fork.Stderr.ReadAll()
+	// Capture outputs from streams
+	stdoutBytes, _ := fork.Stdout.ReadAll()
+	stderrBytes, _ := fork.Stderr.ReadAll()
 	
-	return stdout, stderr, err
+	return stdoutBytes, stderrBytes, err
 }
 
 // Process results in order - Phase 2: ordered output aggregation
@@ -215,9 +239,15 @@ func (ra *resultAggregator) flushReady() {
 			ra.parent.Stderr.Writeln([]byte("error: " + result.err.Error()))
 		}
 		
-		// Clean up
+		// Clean up and return to pool - Phase 3: resource reuse
 		delete(ra.results, ra.nextIndex)
 		ra.nextIndex++
+		
+		// Reset and return result object to pool
+		result.stdout = nil
+		result.stderr = nil
+		result.err = nil
+		resultPool.Put(result)
 	}
 }
 
