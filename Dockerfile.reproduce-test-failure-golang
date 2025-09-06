@@ -1,0 +1,27 @@
+FROM docker.io/golang:1.25.0
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    make \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create user with @ symbol in username (simulating AD domain login)
+RUN useradd --badname -m -s /bin/bash "jeff@melton.casa"
+
+# Set up the problematic PATH environment that causes env command issues
+USER "jeff@melton.casa"
+WORKDIR "/home/jeff@melton.casa"
+RUN mkdir -p .atuin/bin && \
+    echo '# Atuin env setup that breaks tests' > .atuin/bin/env && \
+    chmod 644 .atuin/bin/env
+
+# Copy murex source code
+COPY --chown="jeff@melton.casa":"jeff@melton.casa" . /home/jeff@melton.casa/murex
+WORKDIR "/home/jeff@melton.casa/murex"
+
+# Set PATH to include .atuin/bin before system paths (reproduces the env issue)
+ENV PATH="/home/jeff@melton.casa/.atuin/bin:$PATH"
+
+# Run the failing tests
+CMD ["sh", "-c", "make build && go test ./lang -v -run 'TestVarEnv' && go test ./lang/expressions -v -run 'TestParseVarsTilderPlusNamePositive'"]
